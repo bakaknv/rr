@@ -1,0 +1,6 @@
+# Add these paths to /etc/sysupgrade.conf (or to a /lib/upgrade/keep.d file).
+/usr/bin/rrws-7best
+/usr/bin/rrws-7best-cron
+/usr/bin/rrws-detector-sync
+/root/ont-reboot.sh
+/root/ont-cycle.sh

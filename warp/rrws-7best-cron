@@ -1,0 +1,27 @@
+#!/bin/sh
+# Cron wrapper for rrws-7best.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+LOG=/root/rrws-7best/cron.log
+TMP="$LOG.tmp.$$"
+mkdir -p /root/rrws-7best || exit 1
+trap 'rm -f "$TMP"' EXIT INT TERM
+
+# Keep the last 48 backups (about a day at a 30-minute interval).
+i=0
+for d in $(ls -dt /root/rrws-7best/backup-* 2>/dev/null); do
+	i=$((i + 1))
+	[ "$i" -gt 48 ] && rm -rf "$d"
+done
+
+# Write this run to a temporary file and replace cron.log only when it is
+# finished: the log always holds exactly the last check, never a growing pile.
+{
+	echo "=== $(date '+%Y-%m-%d %H:%M:%S') ==="
+	/usr/bin/rrws-7best --apply --sample 8
+	echo "=== exit $? ==="
+} > "$TMP" 2>&1
+
+chmod 600 "$TMP"
+mv "$TMP" "$LOG"

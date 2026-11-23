@@ -1,0 +1,5 @@
+# Every 30 minutes: scan WARP and replace endpoints of rrws_* interfaces.
+*/30 * * * * /usr/bin/rrws-7best-cron
+
+# ONT reboot at 05:00.
+0 5 * * * /root/ont-reboot.sh >>/var/log/ont-reboot.log 2>&1

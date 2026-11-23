@@ -1,0 +1,14 @@
+# logs and runtime data
+*.log
+*.log.*
+cron.log*
+scan-*.json
+candidates-*.tsv
+report-*.tsv
+backup-*/
+tmp/
+
+# secrets
+ont.env
+*.secret
+rrws-account.json

@@ -1,0 +1,473 @@
+#!/bin/sh
+# rrws-7best.sh - scan Cloudflare WARP and rotate the endpoints of the
+# AmneziaWG interfaces created by RR WARP Scanner.
+#
+# It picks the best endpoints by YouTube latency: the TLS round-trip to
+# get:www.youtube.com through a real WARP tunnel (tls_rtt_ms in the engine
+# JSON). Endpoints with a working video:www.youtube.com check rank above
+# those without it; torn endpoints and endpoints with packet loss are dropped.
+#
+# The interfaces are updated in place: only endpoint_host / endpoint_port
+# change, so names, keys, firewall zones and ZeroBlock references stay valid.
+#
+# Default is a DRY RUN. Add --apply to write the new endpoints.
+#
+# Usage:
+#   rrws-7best.sh [options]
+#
+# Options:
+#   --apply                 write the new endpoints (default: dry run)
+#   --dry-run               only scan and print the plan (default)
+#   --ifaces "a b c"        interface list; default: auto-detect rrws_created=1
+#   --from-json FILE        reuse an existing scan JSON instead of scanning
+#   --count N               how many interfaces / endpoints (default: all detected)
+#   --sample N              addresses per subnet for the scan (default: 20)
+#   --timeout N             per-request timeout, seconds (default: 3)
+#   --jobs N                tunnel workers (default: 64)
+#   --main IFACE            interface that gets the best endpoint
+#                           (default: rrws_awg_sthm)
+#   --no-exclude-dme        do not pass --exclude-node DME
+#   --pure-latency          rank by YouTube GET RTT only, without putting
+#                           endpoints with a working video check first
+#   --verbose               show engine scan progress even when stderr is
+#                           not a terminal
+#   --force                 reload even if every interface already has the
+#                           selected endpoint (the default skips that)
+#   --no-rollback           leave a partially applied result on failure
+#   --wait N                seconds to wait for handshakes (default: 60)
+#   -h, --help              this help
+#
+# Examples:
+#   rrws-7best.sh                     # scan and show the 7 best, change nothing
+#   rrws-7best.sh --apply             # scan and replace the endpoints
+#   rrws-7best.sh --sample 30 --apply # wider search
+#
+# Exit codes: 0 ok/dry-run, 1 error, 2 bad usage.
+
+set -u
+
+# A long scan should survive an SSH drop; the process is still killable with
+# Ctrl+C or SIGTERM.
+trap '' HUP
+
+ENGINE=/usr/bin/rrws
+ACCOUNT=/etc/rrws-account.json
+PERSIST=/root/rrws-7best
+WORK=/tmp/rrws-7best
+LOCK=/tmp/rrws-7best.lock
+
+IFACES=""
+FROM_JSON=""
+COUNT=""
+SAMPLE=20
+TIMEOUT=3
+JOBS=64
+TLS_HOSTS="get:www.youtube.com,video:www.youtube.com"
+EXCLUDE_NODES="DME"
+MAIN_IFACE="rrws_awg_sthm"
+APPLY=0
+ROLLBACK=1
+PURE_LATENCY=0
+FORCE=0
+VERBOSE=0
+HANDSHAKE_WAIT=60
+RETRY_ROUNDS=2
+
+log() { echo "rrws-7best: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+usage() {
+	sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+	exit 0
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--apply) APPLY=1 ;;
+		--dry-run) APPLY=0 ;;
+		--ifaces) [ $# -ge 2 ] || die "--ifaces needs an argument"; IFACES=$2; shift ;;
+		--from-json) [ $# -ge 2 ] || die "--from-json needs an argument"; FROM_JSON=$2; shift ;;
+		--count) [ $# -ge 2 ] || die "--count needs an argument"; COUNT=$2; shift ;;
+		--sample) [ $# -ge 2 ] || die "--sample needs an argument"; SAMPLE=$2; shift ;;
+		--timeout) [ $# -ge 2 ] || die "--timeout needs an argument"; TIMEOUT=$2; shift ;;
+		--jobs) [ $# -ge 2 ] || die "--jobs needs an argument"; JOBS=$2; shift ;;
+		--main) [ $# -ge 2 ] || die "--main needs an argument"; MAIN_IFACE=$2; shift ;;
+		--no-exclude-dme) EXCLUDE_NODES="" ;;
+		--pure-latency) PURE_LATENCY=1 ;;
+		--verbose) VERBOSE=1 ;;
+		--force) FORCE=1 ;;
+		--no-rollback) ROLLBACK=0 ;;
+		--wait) [ $# -ge 2 ] || die "--wait needs an argument"; HANDSHAKE_WAIT=$2; shift ;;
+		-h|--help) usage ;;
+		*) die "unknown option: $1 (try --help)" ;;
+	esac
+	shift
+done
+
+[ "$(id -u)" = 0 ] || die "run as root"
+[ -x "$ENGINE" ] || die "engine not found: $ENGINE"
+[ -r "$ACCOUNT" ] || die "account not found: $ACCOUNT"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+command -v uci >/dev/null 2>&1 || die "uci is required"
+command -v awg >/dev/null 2>&1 || die "awg is required"
+command -v flock >/dev/null 2>&1 || die "flock is required"
+command -v ifstatus >/dev/null 2>&1 || die "ifstatus is required"
+
+for _v in SAMPLE TIMEOUT JOBS HANDSHAKE_WAIT; do
+	eval "_n=\$$_v"
+	case "$_n" in ''|*[!0-9]*) die "--$(echo "$_v" | tr 'A-Z_' 'a-z-') must be a number" ;; esac
+done
+if [ -n "$COUNT" ]; then
+	case "$COUNT" in ''|*[!0-9]*) die "--count must be a number" ;; esac
+	[ "$COUNT" -gt 0 ] || die "--count must be greater than 0"
+fi
+
+# --- interface list ---------------------------------------------------------
+if [ -z "$IFACES" ]; then
+	IFACES=$(uci -q show network 2>/dev/null |
+		sed -n "s/^network\.\([^.=]*\)\.rrws_created='1'$/\1/p" |
+		grep '^rrws_' | sort)
+fi
+[ -n "$IFACES" ] || die "no rrws_created interfaces found"
+# Normalise newlines/spaces: the case match below expects " a b c ".
+IFACES=$(echo $IFACES)
+
+set -- $IFACES
+NFOUND=$#
+if [ -z "$COUNT" ]; then
+	COUNT=$NFOUND
+fi
+[ "$NFOUND" -eq "$COUNT" ] ||
+	die "found $NFOUND interfaces, expected $COUNT; use --ifaces/--count (found: $IFACES)"
+
+ACC_KEY=$(jq -r '.private_key // empty' "$ACCOUNT" 2>/dev/null)
+[ -n "$ACC_KEY" ] || die "cannot read private_key from $ACCOUNT"
+
+for n in $IFACES; do
+	[ "$(uci -q get "network.$n.proto")" = "amneziawg" ] ||
+		die "$n is not an amneziawg interface"
+	[ "$(uci -q get "network.$n.private_key")" = "$ACC_KEY" ] ||
+		die "$n uses a different WARP key than $ACCOUNT; refusing to mix accounts"
+	[ -n "$(uci -q get "network.${n}_peer.endpoint_host")" ] ||
+		die "$n has no peer endpoint_host"
+	[ -n "$(uci -q get "network.${n}_peer.endpoint_port")" ] ||
+		die "$n has no peer endpoint_port"
+done
+
+# --- no concurrent scan -----------------------------------------------------
+if [ -f /tmp/rrws-state/pid ]; then
+	_pid=$(cat /tmp/rrws-state/pid 2>/dev/null)
+	case "$_pid" in
+		''|*[!0-9]*) ;;
+		*) [ -d "/proc/$_pid" ] && die "RR WARP Scanner is already scanning (pid $_pid)" ;;
+	esac
+fi
+if pgrep -f "^$ENGINE scan" >/dev/null 2>&1; then
+	die "an rrws scan process is already running"
+fi
+
+mkdir -p "$PERSIST" "$WORK" || die "cannot create work directories"
+exec 9>"$LOCK" || die "cannot open $LOCK"
+flock -n 9 || die "another rrws-7best run holds $LOCK"
+
+PENDING=$(uci changes network 2>/dev/null)
+[ -z "$PENDING" ] || die "uncommitted network changes exist; commit or revert them first:
+$PENDING"
+
+TS=$(date +%Y%m%d-%H%M%S)
+BAK="$PERSIST/backup-$TS"
+mkdir -p "$BAK" || die "cannot create $BAK"
+cp /etc/config/network "$BAK/network" || die "cannot back up /etc/config/network"
+uci export network > "$BAK/network.uci" 2>/dev/null || true
+: > "$BAK/old.tsv"
+for n in $IFACES; do
+	_host=$(uci -q get "network.${n}_peer.endpoint_host")
+	_port=$(uci -q get "network.${n}_peer.endpoint_port")
+	printf '%s\t%s\t%s\n' "$n" "$_host" "$_port" >> "$BAK/old.tsv"
+	_live=$(awg show "$n" endpoints 2>/dev/null | awk 'NR == 1 { print $2 }')
+	[ -n "$_live" ] && [ "$_live" != "$_host:$_port" ] &&
+		log "note: $n is live on $_live, uci says $_host:$_port; reload will apply the uci value"
+done
+log "backup: $BAK/network"
+
+# --- scan -------------------------------------------------------------------
+JSON="$WORK/scan.json"
+SLOG="$WORK/scan.log"
+if [ -n "$FROM_JSON" ]; then
+	[ -s "$FROM_JSON" ] || die "scan JSON not found: $FROM_JSON"
+	JSON=$FROM_JSON
+	log "using existing scan JSON: $JSON"
+else
+	: > "$SLOG"
+	if [ -n "$EXCLUDE_NODES" ]; then
+		log "scanning: ${SAMPLE} addr/subnet, ${JOBS} jobs, timeout ${TIMEOUT}s, excluding $EXCLUDE_NODES"
+	else
+		log "scanning: ${SAMPLE} addr/subnet, ${JOBS} jobs, timeout ${TIMEOUT}s"
+	fi
+	set -- "$ENGINE" scan -a "$ACCOUNT" -p awg --json -no-report \
+		-n "$SAMPLE" -t "$TIMEOUT" -jt "$JOBS" -P --tun-ping-count 10 \
+		--check-tls "$TLS_HOSTS"
+	[ -n "$EXCLUDE_NODES" ] && set -- "$@" --exclude-node "$EXCLUDE_NODES"
+	# Show the engine's progress lines on the console, but only when there is
+	# a terminal: cron must not fill its log with phase-by-phase noise.
+	SHOW_PROGRESS=0
+	[ -t 2 ] && SHOW_PROGRESS=1
+	[ "$VERBOSE" = 1 ] && SHOW_PROGRESS=1
+	if [ "$SHOW_PROGRESS" = 1 ]; then
+		FIFO="$WORK/err.$$"
+		RCF="$WORK/rc.$$"
+		rm -f "$FIFO" "$RCF"
+		mkfifo "$FIFO" || die "cannot create $FIFO"
+		( "$@" > "$JSON" 2> "$FIFO"; echo $? > "$RCF" ) &
+		_ep=$!
+		tee -a "$SLOG" < "$FIFO" >&2
+		wait "$_ep" 2>/dev/null || true
+		RC=$(cat "$RCF" 2>/dev/null)
+		rm -f "$FIFO" "$RCF"
+		[ -n "$RC" ] || RC=1
+	else
+		"$@" > "$JSON" 2> "$SLOG"
+		RC=$?
+	fi
+	if [ "$RC" -ne 0 ]; then
+		tail -n 30 "$SLOG" >&2
+		die "engine exited with $RC"
+	fi
+	[ -s "$JSON" ] || die "engine produced no JSON; see $SLOG"
+fi
+
+# --- pick the best by YouTube GET latency -----------------------------------
+# Rank: video check passed first, then lowest get:www.youtube.com RTT,
+# then lowest in-tunnel ping, then lowest host ping. Torn/lossy rows dropped.
+CAND="$WORK/candidates.tsv"
+jq -r --argjson take "$((COUNT + 10))" --argjson pure "$PURE_LATENCY" '
+	def getchk: [.tls_checks[]? | select(.host == "get:www.youtube.com")][0];
+	def vidchk: [.tls_checks[]? | select(.host == "video:www.youtube.com")][0];
+	[ .endpoints[]
+	  | select(.torn != true and ((.loss_pct // 0) == 0))
+	  | (getchk) as $g
+	  | (vidchk) as $v
+	  | select($g != null and $g.ok == true and (($g.rtt_ms // 0) > 0))
+	  | { endpoint: .endpoint,
+	      yt: $g.rtt_ms,
+	      vid_ok: (($v != null) and ($v.ok == true)),
+	      node: (.node // ""),
+	      country: (.country // ""),
+	      tun: (.tun_ping_ms // 0),
+	      ping: (.ping_ms // 0) } ]
+	| sort_by((if $pure == 1 then 0 elif .vid_ok then 0 else 1 end),
+	          .yt,
+	          (if .tun > 0 then .tun else 999999 end),
+	          (if .ping > 0 then .ping else 999999 end),
+	          .endpoint)
+	| .[:$take]
+	| .[]
+	| [.endpoint, .yt,
+	   (if .vid_ok then "video-ok" else "video-fail" end),
+	   .node, .country, .tun, .ping] | @tsv
+' "$JSON" > "$CAND" || die "jq could not parse $JSON"
+
+N=$(wc -l < "$CAND" | tr -d ' ')
+if [ "$N" -lt "$COUNT" ]; then
+	log "suitable endpoints: $N (need $COUNT); increase --sample or scan later"
+	exit 1
+fi
+
+log "top candidates by YouTube GET latency:"
+awk -F '\t' 'NR <= '"$COUNT"' {
+	printf "  %2d. %-22s %5s ms  %-10s %-4s tun=%-5s ping=%s\n",
+	       NR, $1, $2, $3, $4, $6, $7
+}' "$CAND" >&2
+
+# --- map the best endpoints to the interfaces -------------------------------
+# The ZeroBlock main interface (awg.interface) gets the best endpoint.
+ORDER=""
+case " $IFACES " in
+	*" $MAIN_IFACE "*) ORDER="$MAIN_IFACE" ;;
+esac
+for n in $IFACES; do
+	[ "$n" = "$MAIN_IFACE" ] || ORDER="$ORDER $n"
+done
+ORDER=$(echo $ORDER)
+
+MAP="$WORK/mapping.tsv"
+: > "$MAP"
+i=0
+for n in $ORDER; do
+	i=$((i + 1))
+	line=$(sed -n "${i}p" "$CAND")
+	ep=$(printf '%s\n' "$line" | cut -f1)
+	case "$ep" in *:*:*) die "IPv6 endpoint is not supported here: $ep" ;; esac
+	ip=${ep%:*}
+	port=${ep##*:}
+	printf '%s\t%s\t%s\n' "$n" "$ip" "$port" >> "$MAP"
+done
+
+log "plan:"
+while read -r n ip port; do
+	old=$(awk -F '\t' -v k="$n" '$1 == k { print $2 ":" $3 }' "$BAK/old.tsv")
+	yt=$(awk -F '\t' -v k="$ip:$port" '$1 == k { print $2 " ms (" $3 ")" }' "$CAND")
+	printf '  %-18s %-22s -> %-22s %s\n' "$n" "$old" "$ip:$port" "$yt" >&2
+done < "$MAP"
+
+# Does any interface actually need a new endpoint? Hourly runs should not
+# reload the network when the selection is already in place.
+CHANGED=0
+CHANGED_IFACES=""
+while read -r n ip port; do
+	_cur="$(uci -q get "network.${n}_peer.endpoint_host"):$(uci -q get "network.${n}_peer.endpoint_port")"
+	if [ "$_cur" != "$ip:$port" ]; then
+		CHANGED=1
+		CHANGED_IFACES="$CHANGED_IFACES $n"
+	fi
+done < "$MAP"
+if [ "$FORCE" = 1 ]; then
+	CHANGED=1
+	CHANGED_IFACES="$IFACES"
+fi
+
+if [ "$APPLY" -ne 1 ]; then
+	log "dry run: nothing changed. Re-run with --apply to write these endpoints."
+	exit 0
+fi
+
+if [ "$CHANGED" -eq 0 ]; then
+	log "all interfaces already use the selected endpoints; nothing to do"
+	exit 0
+fi
+
+# --- apply ------------------------------------------------------------------
+# `network reload` alone does not restart an AmneziaWG interface when only its
+# peer endpoint changed; `ifup <iface>` does. It also avoids touching WAN/LAN.
+log "writing endpoints and bringing changed interfaces up"
+while read -r n ip port; do
+	_cur="$(uci -q get "network.${n}_peer.endpoint_host"):$(uci -q get "network.${n}_peer.endpoint_port")"
+	if [ "$FORCE" != 1 ] && [ "$_cur" = "$ip:$port" ]; then
+		continue
+	fi
+	uci set "network.${n}_peer.endpoint_host=$ip" || die "uci set host for $n failed"
+	uci set "network.${n}_peer.endpoint_port=$port" || die "uci set port for $n failed"
+done < "$MAP"
+uci commit network || die "uci commit network failed"
+
+# Interfaces actually brought up in this run: only those need a fresh
+# handshake. An interface whose endpoint did not change is already working.
+TOUCHED_IFACES="$CHANGED_IFACES"
+
+# An interface is ready when it is up and its live peer endpoint matches the
+# selected one. A fresh handshake is reported but not required: WireGuard may
+# not initiate one until ZeroBlock's urltest sends traffic through it. The scan
+# already proved the data path through a userspace tunnel with the same keys.
+wait_ready() {
+	_start=$1
+	_deadline=$((_start + HANDSHAKE_WAIT))
+	while :; do
+		: > "$WORK/failed"
+		: > "$WORK/reasons"
+		: > "$WORK/nohs"
+		while read -r n ip port; do
+			_ok=1
+			_why=""
+			ifstatus "$n" 2>/dev/null | grep -q '"up": true' || { _ok=0; _why="down"; }
+			_ep=$(awg show "$n" endpoints 2>/dev/null | awk 'NR == 1 { print $2 }')
+			[ "$_ep" = "$ip:$port" ] || { _ok=0; _why="$_why endpoint=$_ep"; }
+			_touch=0
+			case " $TOUCHED_IFACES " in *" $n "*) _touch=1 ;; esac
+			if [ "$_ok" = 1 ] && { [ "$FORCE" = 1 ] || [ "$_touch" = 1 ]; }; then
+				_hs=$(awg show "$n" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 + 0 }')
+				[ "${_hs:-0}" -ge $((_start - 5)) ] || echo "$n" >> "$WORK/nohs"
+			fi
+			[ "$_ok" = 1 ] || { echo "$n" >> "$WORK/failed"; echo "$n:$_why" >> "$WORK/reasons"; }
+		done < "$MAP"
+		if [ ! -s "$WORK/failed" ]; then
+			[ -s "$WORK/nohs" ] &&
+				log "up and configured, no fresh handshake yet: $(tr '\n' ' ' < "$WORK/nohs")"
+			return 0
+		fi
+		[ "$(date +%s)" -ge "$_deadline" ] && return 1
+		sleep 3
+	done
+}
+
+restore_network() {
+	cp "$BAK/network" /etc/config/network || return 1
+	/etc/init.d/network reload >/dev/null 2>&1
+	for n in $IFACES; do
+		ifup "$n" >/dev/null 2>&1 || true
+	done
+	return 0
+}
+
+START=$(date +%s)
+for n in $CHANGED_IFACES; do
+	ifup "$n" >/dev/null 2>&1 || log "ifup $n returned non-zero"
+done
+
+ROUND=0
+NEXT=$COUNT
+while ! wait_ready "$START"; do
+	FAILED=$(tr '\n' ' ' < "$WORK/failed")
+	log "not ready: $FAILED"
+	[ -s "$WORK/reasons" ] && log "reasons: $(tr '\n' ';' < "$WORK/reasons")"
+	[ "$ROUND" -ge "$RETRY_ROUNDS" ] && break
+	ROUND=$((ROUND + 1))
+	log "retry $ROUND with spare candidates"
+	RETRY_LIST=""
+	while read -r n; do
+		NEXT=$((NEXT + 1))
+		line=$(sed -n "${NEXT}p" "$CAND")
+		[ -n "$line" ] || { log "no more spare candidates"; break; }
+		ep=$(printf '%s\n' "$line" | cut -f1)
+		case "$ep" in *:*:*) die "IPv6 endpoint is not supported here: $ep" ;; esac
+		ip=${ep%:*}
+		port=${ep##*:}
+		uci set "network.${n}_peer.endpoint_host=$ip" || break
+		uci set "network.${n}_peer.endpoint_port=$port" || break
+		awk -F '\t' -v n="$n" -v ip="$ip" -v p="$port" \
+			'BEGIN { OFS = "\t" } $1 == n { $2 = ip; $3 = p } { print }' \
+			"$MAP" > "$MAP.new" && mv "$MAP.new" "$MAP"
+		RETRY_LIST="$RETRY_LIST $n"
+	done < "$WORK/failed"
+	uci commit network || die "uci commit network failed on retry"
+	if [ -n "$RETRY_LIST" ]; then
+		START=$(date +%s)
+		for n in $RETRY_LIST; do
+			ifup "$n" >/dev/null 2>&1 || log "ifup $n returned non-zero"
+		done
+	fi
+done
+
+if [ -s "$WORK/failed" ]; then
+	log "interfaces still not ready: $(tr '\n' ' ' < "$WORK/failed")"
+	if [ "$ROLLBACK" = 1 ]; then
+		log "rolling back /etc/config/network from $BAK/network"
+		restore_network || die "rollback failed"
+		die "rolled back to the previous endpoints"
+	fi
+	die "some interfaces are not ready; --no-rollback was given"
+fi
+
+# --- report -----------------------------------------------------------------
+REPORT="$PERSIST/report-$TS.tsv"
+{
+	printf '# %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+	printf '# scan: sample=%s jobs=%s timeout=%s exclude=%s\n' \
+		"$SAMPLE" "$JOBS" "$TIMEOUT" "${EXCLUDE_NODES:-none}"
+	printf 'iface\told\tnew\tyt_ms\tvideo\tnode\tcountry\ttun_ms\tping_ms\n'
+	while read -r n ip port; do
+		old=$(awk -F '\t' -v k="$n" '$1 == k { print $2 ":" $3 }' "$BAK/old.tsv")
+		awk -F '\t' -v n="$n" -v old="$old" -v ep="$ip:$port" '
+			$1 == ep {
+				printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				       n, old, ep, $2, $3, $4, $5, $6, $7
+			}' "$CAND"
+	done < "$MAP"
+} > "$REPORT"
+
+cp "$MAP" "$PERSIST/mapping-$TS.tsv"
+cp "$CAND" "$PERSIST/candidates-$TS.tsv"
+cp "$JSON" "$PERSIST/scan-$TS.json"
+
+log "done. report: $REPORT"
+log "backup: $BAK/network"
+exit 0
